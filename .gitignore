@@ -1,0 +1,7 @@
+
+Models/*.onnx
+
+bin/
+obj/
+.vs/
+Models/*.onnx

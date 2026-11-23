@@ -1,0 +1,1 @@
+[{"Id":"51461cec-b71d-4bc8-a277-b9cc8926b959","TenantId":"default","Name":"Samir IP Cam","Location":"north Wing","Url":"http://192.168.0.125:8080/video","Modules":["face","phone"]},{"Id":"32fa267d-408e-4d41-9a27-c54700faee73","TenantId":"default","Name":"anshit","Location":"katak room","Url":"http://192.168.0.124:8080/video","Modules":["face"]}]

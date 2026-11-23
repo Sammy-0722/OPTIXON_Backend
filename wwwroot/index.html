@@ -1,0 +1,356 @@
+﻿<script>
+        const video = document.getElementById("video");
+        const canvas = document.getElementById("canvas");
+        const resultImage = document.getElementById("resultImage");
+
+        const ctx = canvas.getContext("2d");
+
+        let cameraStream = null;
+        let timerId = null;
+        let running = false;
+        let requestInProgress = false;
+
+        // Face tracking
+        let trackedFaces = [];
+        let nextTrackId = 1;
+
+        // Detection interval
+        const DETECTION_INTERVAL = 300;
+
+        // A face must overlap sufficiently with an existing track.
+        const IOU_THRESHOLD = 0.30;
+
+        // Remove tracks not seen for this duration.
+        const TRACK_TIMEOUT = 1500;
+
+        // Re-recognize an unknown face after this interval.
+        const UNKNOWN_RETRY_INTERVAL = 3000;
+
+        function calculateIoU(a, b) {
+            const x1 = Math.max(a.x, b.x);
+            const y1 = Math.max(a.y, b.y);
+            const x2 = Math.min(a.x + a.width, b.x + b.width);
+            const y2 = Math.min(a.y + a.height, b.y + b.height);
+
+            const intersectionWidth = Math.max(0, x2 - x1);
+            const intersectionHeight = Math.max(0, y2 - y1);
+
+            const intersection =
+                intersectionWidth * intersectionHeight;
+
+            const areaA = a.width * a.height;
+            const areaB = b.width * b.height;
+
+            const union = areaA + areaB - intersection;
+
+            return union > 0 ? intersection / union : 0;
+        }
+
+        function updateTracks(detections) {
+            const now = Date.now();
+
+            // Remove old tracks.
+            trackedFaces = trackedFaces.filter(
+                face => now - face.lastSeen < TRACK_TIMEOUT
+            );
+
+            const matchedTrackIds = new Set();
+
+            for (const detection of detections) {
+                const box = {
+                    x: detection.x,
+                    y: detection.y,
+                    width: detection.width,
+                    height: detection.height
+                };
+
+                let bestTrack = null;
+                let bestIoU = 0;
+
+                for (const track of trackedFaces) {
+                    if (matchedTrackIds.has(track.id)) {
+                        continue;
+                    }
+
+                    const iou = calculateIoU(box, track.box);
+
+                    if (iou > bestIoU) {
+                        bestIoU = iou;
+                        bestTrack = track;
+                    }
+                }
+
+                if (bestTrack && bestIoU >= IOU_THRESHOLD) {
+                    bestTrack.box = box;
+                    bestTrack.detection = detection;
+                    bestTrack.lastSeen = now;
+
+                    matchedTrackIds.add(bestTrack.id);
+                } else {
+                    const newTrack = {
+                        id: nextTrackId++,
+                        box,
+                        detection,
+                        name: "Recognizing...",
+                        similarity: null,
+                        recognized: false,
+                        lastSeen: now,
+                        lastRecognitionAttempt: 0,
+                        recognitionInProgress: false
+                    };
+
+                    trackedFaces.push(newTrack);
+                    matchedTrackIds.add(newTrack.id);
+                }
+            }
+        }
+
+        async function recognizeFace(track, imageBlob) {
+            if (track.recognitionInProgress) return;
+
+            track.recognitionInProgress = true;
+            track.lastRecognitionAttempt = Date.now();
+
+            try {
+                const detection = track.detection;
+
+                const formData = new FormData();
+
+                formData.append("Image", imageBlob, "webcam.jpg");
+
+                formData.append("X", detection.x);
+                formData.append("Y", detection.y);
+                formData.append("Width", detection.width);
+                formData.append("Height", detection.height);
+                formData.append("Confidence", detection.confidence);
+
+                const landmarks = detection.landmarks;
+
+                formData.append("LeftEyeX", landmarks[0][0]);
+                formData.append("LeftEyeY", landmarks[0][1]);
+
+                formData.append("RightEyeX", landmarks[1][0]);
+                formData.append("RightEyeY", landmarks[1][1]);
+
+                formData.append("NoseX", landmarks[2][0]);
+                formData.append("NoseY", landmarks[2][1]);
+
+                formData.append("LeftMouthX", landmarks[3][0]);
+                formData.append("LeftMouthY", landmarks[3][1]);
+
+                formData.append("RightMouthX", landmarks[4][0]);
+                formData.append("RightMouthY", landmarks[4][1]);
+
+                const response = await fetch(
+                    "/api/FaceRecognition/recognize-detected",
+                    {
+                        method: "POST",
+                        body: formData
+                    }
+                );
+
+                if (!response.ok) {
+                    throw new Error("Face recognition request failed.");
+                }
+
+                const data = await response.json();
+
+                // The track may have disappeared while recognition ran.
+                const currentTrack = trackedFaces.find(
+                    face => face.id === track.id
+                );
+
+                if (!currentTrack) return;
+
+                currentTrack.name = data.name;
+                currentTrack.similarity = data.similarity;
+                currentTrack.recognized = data.recognized;
+
+                if (data.imageBase64) {
+                    resultImage.src =
+                        "data:image/jpeg;base64," + data.imageBase64;
+                }
+
+            } catch (error) {
+                console.error("Recognition error:", error);
+            } finally {
+                track.recognitionInProgress = false;
+            }
+        }
+
+        function updateRecognitionDisplay() {
+            const names = trackedFaces.map(face => {
+                const similarity = face.similarity != null
+                    ? (face.similarity * 100).toFixed(1) + "%"
+                    : "Pending";
+
+                return `${face.name} (${similarity})`;
+            });
+
+            const resultElement =
+                document.getElementById("recognizedName");
+
+            if (resultElement) {
+                resultElement.textContent =
+                    names.length > 0 ? names.join(", ") : "No face detected";
+            }
+
+            const detectionsElement =
+                document.getElementById("detections");
+
+            if (detectionsElement) {
+                detectionsElement.innerHTML = trackedFaces
+                    .map(face => `
+                        <div>
+                            <strong>${face.name}</strong>
+                            - Confidence: ${(
+                                face.detection.confidence * 100
+                            ).toFixed(1)}%
+                        </div>
+                    `)
+                    .join("");
+            }
+        }
+
+        async function captureAndRecognize() {
+            if (!running || requestInProgress) return;
+
+            if (video.readyState < 2) return;
+
+            requestInProgress = true;
+
+            const startTime = performance.now();
+
+            try {
+                canvas.width = video.videoWidth;
+                canvas.height = video.videoHeight;
+
+                ctx.drawImage(
+                    video,
+                    0,
+                    0,
+                    canvas.width,
+                    canvas.height
+                );
+
+                const imageBlob = await new Promise(resolve => {
+                    canvas.toBlob(resolve, "image/jpeg", 0.85);
+                });
+
+                if (!imageBlob) return;
+
+                // STEP 1: YOLO face detection only.
+                const formData = new FormData();
+
+                formData.append("image", imageBlob, "webcam.jpg");
+
+                const response = await fetch(
+                    "/api/FaceRecognition/detect",
+                    {
+                        method: "POST",
+                        body: formData
+                    }
+                );
+
+                if (!response.ok) {
+                    throw new Error("Face detection request failed.");
+                }
+
+                const data = await response.json();
+
+                // STEP 2: Update face tracking.
+                updateTracks(data.detections || []);
+
+                // STEP 3: ArcFace only for new or retryable unknown tracks.
+                for (const track of trackedFaces) {
+                    const needsRecognition =
+                        !track.recognized &&
+                        !track.recognitionInProgress &&
+                        Date.now() - track.lastRecognitionAttempt >=
+                            UNKNOWN_RETRY_INTERVAL;
+
+                    if (needsRecognition) {
+                        // Use the captured image belonging to this detection.
+                        recognizeFace(track, imageBlob);
+                    }
+                }
+
+                updateRecognitionDisplay();
+
+                const elapsed = performance.now() - startTime;
+
+                const recognitionFpsElement =
+                    document.getElementById("recognitionFps");
+
+                if (recognitionFpsElement) {
+                    recognitionFpsElement.textContent =
+                        (1000 / elapsed).toFixed(1);
+                }
+
+            } catch (error) {
+                console.error("Webcam processing error:", error);
+            } finally {
+                requestInProgress = false;
+            }
+        }
+
+        async function startWebcam() {
+            try {
+                cameraStream = await navigator.mediaDevices.getUserMedia({
+                    video: {
+                        width: { ideal: 640 },
+                        height: { ideal: 480 }
+                    },
+                    audio: false
+                });
+
+                video.srcObject = cameraStream;
+                await video.play();
+
+                running = true;
+                trackedFaces = [];
+                nextTrackId = 1;
+
+                timerId = setInterval(
+                    captureAndRecognize,
+                    DETECTION_INTERVAL
+                );
+
+                captureAndRecognize();
+
+                if (typeof measureCameraFPS === "function") {
+                    measureCameraFPS();
+                }
+
+            } catch (error) {
+                console.error("Camera error:", error);
+                alert("Unable to access webcam.");
+            }
+        }
+
+        function stopWebcam() {
+            running = false;
+
+            if (timerId) {
+                clearInterval(timerId);
+                timerId = null;
+            }
+
+            if (cameraStream) {
+                cameraStream.getTracks().forEach(track => track.stop());
+                cameraStream = null;
+            }
+
+            video.srcObject = null;
+
+            trackedFaces = [];
+            requestInProgress = false;
+
+            const resultElement =
+                document.getElementById("recognizedName");
+
+            if (resultElement) {
+                resultElement.textContent = "Camera stopped";
+            }
+        }
+</script>
